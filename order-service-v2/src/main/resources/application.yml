@@ -1,0 +1,27 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: order-service-v2
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/shadowdb}
+    username: ${SPRING_DATASOURCE_USERNAME:shadow}
+    password: ${SPRING_DATASOURCE_PASSWORD:shadow123}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    properties:
+      hibernate.dialect: org.hibernate.dialect.PostgreSQLDialect
+
+# ── Chaos Engineering Knobs ───────────────────────────────────────────────────
+# Set via env vars at runtime — no rebuild required
+chaos:
+  delay-ms: ${CHAOS_DELAY_MS:0}       # artificial latency in ms
+  fail-rate: ${CHAOS_FAIL_RATE:0.0}   # 0.0-1.0 fraction of requests to fail
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics
