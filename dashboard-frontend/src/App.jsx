@@ -31,13 +31,18 @@ const colors = {
   mint: "#dff9ec",
 };
 
-function usePoll(url, interval = 5000) {
+function usePoll(url, interval = 5000, enabled = true, refreshToken = 0) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [loading, setLoading] = useState(true);
 
   const fetchData = useCallback(async () => {
+    if (!enabled) {
+      return;
+    }
     try {
+      setLoading(true);
       const res = await fetch(url);
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
@@ -48,16 +53,21 @@ function usePoll(url, interval = 5000) {
       setLastUpdated(new Date());
     } catch (e) {
       setError(e.message || "Network error");
+    } finally {
+      setLoading(false);
     }
-  }, [url]);
+  }, [enabled, url]);
 
   useEffect(() => {
+    if (!enabled) {
+      return;
+    }
     fetchData();
     const id = setInterval(fetchData, interval);
     return () => clearInterval(id);
-  }, [fetchData, interval]);
+  }, [enabled, fetchData, interval, refreshToken]);
 
-  return { data, error, lastUpdated };
+  return { data, error, lastUpdated, loading };
 }
 
 function Section({ title, subtitle, children }) {
@@ -152,6 +162,18 @@ function parseDiffSummary(raw) {
   }
 }
 
+function toCsvRow(values) {
+  return values
+    .map((value) => {
+      const normalized = String(value ?? "");
+      if (normalized.includes(",") || normalized.includes('"') || normalized.includes("\n")) {
+        return `"${normalized.replace(/"/g, '""')}"`;
+      }
+      return normalized;
+    })
+    .join(",");
+}
+
 function ConnectionPill({ ok, text }) {
   return (
     <span
@@ -175,17 +197,71 @@ function ConnectionPill({ ok, text }) {
 }
 
 export default function App() {
-  const summaryPoll = usePoll(`${API}/api/analytics/summary`, 4000);
-  const latencyPoll = usePoll(`${API}/api/analytics/latency`, 10000);
-  const mismatchesPoll = usePoll(`${API}/api/analytics/mismatches?limit=12`, 6000);
-  const endpointsPoll = usePoll(`${API}/api/analytics/endpoints`, 12000);
-  const timelinePoll = usePoll(`${API}/api/analytics/timeline`, 10000);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [refreshEverySec, setRefreshEverySec] = useState(6);
+  const [refreshToken, setRefreshToken] = useState(0);
+  const [mismatchSearch, setMismatchSearch] = useState("");
+  const [mismatchMethod, setMismatchMethod] = useState("all");
+
+  const pollMs = refreshEverySec * 1000;
+  const forceRefresh = useCallback(() => {
+    setRefreshToken((n) => n + 1);
+  }, []);
+
+  const summaryPoll = usePoll(`${API}/api/analytics/summary`, pollMs, autoRefresh, refreshToken);
+  const latencyPoll = usePoll(`${API}/api/analytics/latency`, pollMs, autoRefresh, refreshToken);
+  const mismatchesPoll = usePoll(`${API}/api/analytics/mismatches?limit=50`, pollMs, autoRefresh, refreshToken);
+  const endpointsPoll = usePoll(`${API}/api/analytics/endpoints`, pollMs, autoRefresh, refreshToken);
+  const timelinePoll = usePoll(`${API}/api/analytics/timeline`, pollMs, autoRefresh, refreshToken);
 
   const summary = summaryPoll.data;
   const latency = Array.isArray(latencyPoll.data) ? latencyPoll.data : [];
   const mismatches = Array.isArray(mismatchesPoll.data) ? mismatchesPoll.data : [];
   const endpoints = Array.isArray(endpointsPoll.data) ? endpointsPoll.data : [];
   const timeline = Array.isArray(timelinePoll.data) ? timelinePoll.data : [];
+
+  const anyLoading = [summaryPoll, latencyPoll, mismatchesPoll, endpointsPoll, timelinePoll].some((poll) => poll.loading);
+  const errors = [summaryPoll, latencyPoll, mismatchesPoll, endpointsPoll, timelinePoll]
+    .map((poll) => poll.error)
+    .filter(Boolean);
+  const uniqueMethods = useMemo(
+    () => Array.from(new Set(mismatches.map((row) => (row.method || "UNKNOWN").toUpperCase()))).sort(),
+    [mismatches]
+  );
+
+  const filteredMismatches = useMemo(() => {
+    return mismatches.filter((row) => {
+      const method = (row.method || "UNKNOWN").toUpperCase();
+      const path = (row.path || "").toLowerCase();
+      const query = mismatchSearch.trim().toLowerCase();
+      const byMethod = mismatchMethod === "all" || method === mismatchMethod;
+      const bySearch = !query || method.includes(query) || path.includes(query);
+      return byMethod && bySearch;
+    });
+  }, [mismatchMethod, mismatchSearch, mismatches]);
+
+  const exportEndpointsCsv = useCallback(() => {
+    if (!endpoints.length) {
+      return;
+    }
+    const header = toCsvRow(["Path", "Mismatch Rate %", "Mismatched Requests", "Total Requests"]);
+    const rows = endpoints.map((row) =>
+      toCsvRow([
+        row.path || "unknown",
+        Number(row.mismatchRatePct ?? 0).toFixed(2),
+        row.mismatchedRequests ?? 0,
+        row.totalRequests ?? 0,
+      ])
+    );
+    const csv = [header, ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `endpoint-mismatch-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [endpoints]);
 
   const backendConnected = useMemo(() => {
     return [summaryPoll, latencyPoll, mismatchesPoll, endpointsPoll, timelinePoll].some(
@@ -249,6 +325,65 @@ export default function App() {
           <div style={{ marginTop: 10, color: colors.subInk, fontSize: 12 }}>
             Last update: {lastUpdated ? lastUpdated.toLocaleString() : "Waiting for data"}
           </div>
+          <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <button
+              onClick={() => setAutoRefresh((v) => !v)}
+              style={{
+                border: `1px solid ${colors.border}`,
+                borderRadius: 8,
+                background: autoRefresh ? colors.mint : "#fff",
+                color: colors.ink,
+                fontWeight: 600,
+                padding: "8px 12px",
+                cursor: "pointer",
+              }}
+            >
+              {autoRefresh ? "Auto-refresh: ON" : "Auto-refresh: OFF"}
+            </button>
+            <label style={{ display: "flex", gap: 6, alignItems: "center", color: colors.subInk, fontSize: 13 }}>
+              Refresh interval
+              <select
+                value={refreshEverySec}
+                onChange={(e) => setRefreshEverySec(Number(e.target.value))}
+                style={{ border: `1px solid ${colors.border}`, borderRadius: 8, padding: "6px 8px", color: colors.ink }}
+              >
+                <option value={3}>3s</option>
+                <option value={6}>6s</option>
+                <option value={10}>10s</option>
+                <option value={15}>15s</option>
+              </select>
+            </label>
+            <button
+              onClick={forceRefresh}
+              style={{
+                border: `1px solid ${colors.v1}`,
+                borderRadius: 8,
+                background: "#fff",
+                color: colors.v1,
+                fontWeight: 700,
+                padding: "8px 12px",
+                cursor: "pointer",
+              }}
+            >
+              Refresh now
+            </button>
+            <span style={{ color: colors.subInk, fontSize: 12 }}>{anyLoading ? "Fetching latest data..." : "Data up to date"}</span>
+          </div>
+          {errors.length > 0 ? (
+            <div
+              style={{
+                marginTop: 12,
+                padding: "10px 12px",
+                borderRadius: 10,
+                background: "#ffe9e9",
+                border: "1px solid #f2a6a6",
+                color: colors.danger,
+                fontSize: 12,
+              }}
+            >
+              API errors: {Array.from(new Set(errors)).join(" | ")}
+            </div>
+          ) : null}
         </header>
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12, marginBottom: 16 }}>
@@ -341,11 +476,45 @@ export default function App() {
 
         <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: 14 }}>
           <Section title="Recent Mismatches" subtitle="If empty, your v1 and v2 are currently aligned">
-            {mismatches.length === 0 ? (
+            <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+              <input
+                value={mismatchSearch}
+                onChange={(e) => setMismatchSearch(e.target.value)}
+                placeholder="Search path or method"
+                style={{
+                  minWidth: 220,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: 8,
+                  padding: "8px 10px",
+                  color: colors.ink,
+                }}
+              />
+              <select
+                value={mismatchMethod}
+                onChange={(e) => setMismatchMethod(e.target.value)}
+                style={{
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: 8,
+                  padding: "8px 10px",
+                  color: colors.ink,
+                }}
+              >
+                <option value="all">All methods</option>
+                {uniqueMethods.map((method) => (
+                  <option key={method} value={method}>
+                    {method}
+                  </option>
+                ))}
+              </select>
+              <div style={{ color: colors.subInk, fontSize: 12, display: "flex", alignItems: "center" }}>
+                Showing {filteredMismatches.length} of {mismatches.length}
+              </div>
+            </div>
+            {filteredMismatches.length === 0 ? (
               <div style={{ color: colors.subInk, padding: "12px 0" }}>No mismatches yet.</div>
             ) : (
               <div style={{ display: "grid", gap: 8, maxHeight: 320, overflowY: "auto" }}>
-                {mismatches.map((row, i) => {
+                {filteredMismatches.map((row, i) => {
                   const diffs = parseDiffSummary(row.diffSummary);
                   return (
                     <details
@@ -376,6 +545,23 @@ export default function App() {
           </Section>
 
           <Section title="Endpoints With Highest Mismatch" subtitle="Shows where your experimental version is diverging most">
+            <div style={{ marginBottom: 10 }}>
+              <button
+                onClick={exportEndpointsCsv}
+                disabled={!endpoints.length}
+                style={{
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: 8,
+                  background: endpoints.length ? "#fff" : "#f7f7f7",
+                  color: endpoints.length ? colors.ink : colors.subInk,
+                  fontWeight: 600,
+                  padding: "7px 10px",
+                  cursor: endpoints.length ? "pointer" : "not-allowed",
+                }}
+              >
+                Export endpoint report (CSV)
+              </button>
+            </div>
             <ResponsiveContainer width="100%" height={320}>
               <BarChart
                 layout="vertical"
